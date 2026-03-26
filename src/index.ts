@@ -34,7 +34,7 @@ async function runStart(port: number): Promise<void> {
   process.on("SIGTERM", shutdown);
 
   process.stdout.write(
-    `${chalk.cyanBright("AgentTop")} ${chalk.gray("running")} ${chalk.green(`http://localhost:${port}`)}\n`,
+    `${chalk.cyanBright("AgentTop")} ${chalk.gray("running")} ${chalk.green(`http://localhost:${port}`)} ${chalk.gray(`(prometheus: /metrics)`)}` + "\n",
   );
 }
 

@@ -7,6 +7,7 @@ type Dashboard = {
 };
 
 const HISTORY_SECONDS = 60;
+const LATENCY_WINDOW = 30;
 
 function formatMoney(value: number): string {
   return value.toFixed(4);
@@ -26,37 +27,53 @@ export function startDashboard(metricsBus: MetricsBus): Dashboard {
 
   const grid = new contrib.grid({ rows: 12, cols: 12, screen });
 
-  const tokensLine = grid.set(0, 0, 5, 8, contrib.line, {
+  const tokensLine = grid.set(0, 0, 5, 7, contrib.line, {
     label: " Token Throughput (Tokens/s) ",
     showLegend: false,
     minY: 0,
     wholeNumbersOnly: true,
     style: {
-      line: "magenta",
+      line: "green",
       text: "white",
-      baseline: "cyan",
+      baseline: "magenta",
     },
   });
 
-  const costBar = grid.set(0, 8, 5, 4, contrib.bar, {
+  const costBar = grid.set(0, 7, 5, 3, contrib.bar, {
     label: " Cost by Model (USD) ",
-    barWidth: 7,
-    barSpacing: 2,
+    barWidth: 5,
+    barSpacing: 1,
     xOffset: 1,
     maxHeight: 10,
-    barBgColor: "blue",
+    barBgColor: "magenta",
     barFgColor: "black",
   });
 
-  const requestLog = grid.set(5, 0, 5, 8, contrib.log, {
+  const latencySpark = grid.set(0, 10, 5, 2, contrib.sparkline, {
+    label: " Latency (ms) ",
+    tags: true,
+    style: {
+      fg: "yellow",
+    },
+  });
+
+  const requestLog = grid.set(5, 0, 5, 7, contrib.log, {
     label: " Intercepted Requests ",
     fg: "green",
     selectedFg: "white",
   });
 
-  const totalCostLcd = grid.set(5, 8, 5, 4, contrib.lcd, {
+  const modelTable = grid.set(5, 7, 5, 3, contrib.table, {
+    label: " Top Models ",
+    keys: false,
+    fg: "white",
+    columnSpacing: 2,
+    columnWidth: [11, 8],
+  });
+
+  const totalCostLcd = grid.set(5, 10, 5, 2, contrib.lcd, {
     label: " Total Session Cost ($) ",
-    color: "cyan",
+    color: "green",
     segmentWidth: 0.08,
     segmentInterval: 0.03,
     strokeWidth: 0.1,
@@ -64,20 +81,21 @@ export function startDashboard(metricsBus: MetricsBus): Dashboard {
     display: "0.0000",
   });
 
-  const footer = grid.set(10, 0, 2, 12, blessed.box, {
+  const hud = grid.set(10, 0, 2, 12, blessed.box, {
     tags: true,
-    align: "center",
-    valign: "middle",
-    content:
-      "{bold}AgentTop{/bold}  {gray-fg}::{/gray-fg}  monitor mode active  {gray-fg}::{/gray-fg}  press {bold}q{/bold} to exit",
     border: { type: "line" },
-    style: { fg: "white", border: { fg: "magenta" } },
+    style: {
+      fg: "white",
+      border: { fg: "cyan" },
+    },
+    content: "",
   });
-  void footer;
 
   let totalSessionCost = 0;
+  let requestsSeen = 0;
   const perSecondTokens = new Map<number, number>();
   const modelCostTotals = new Map<string, number>();
+  const latencySamples: number[] = [];
 
   const renderTokens = (): void => {
     const nowSec = Math.floor(Date.now() / 1000);
@@ -110,12 +128,42 @@ export function startDashboard(metricsBus: MetricsBus): Dashboard {
     });
   };
 
+  const renderModelTable = (): void => {
+    const rows = [...modelCostTotals.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([model, cost]) => [model.slice(0, 10), `$${cost.toFixed(4)}`]);
+
+    modelTable.setData({
+      headers: ["Model", "Cost"],
+      data: rows.length > 0 ? rows : [["n/a", "$0.0000"]],
+    });
+  };
+
+  const renderLatency = (): void => {
+    latencySpark.setData(["latency"], [latencySamples]);
+  };
+
   const renderTotalCost = (): void => {
     totalCostLcd.setDisplay(formatMoney(totalSessionCost));
   };
 
+  const renderHud = (): void => {
+    const avgLatency =
+      latencySamples.length > 0
+        ? latencySamples.reduce((sum, value) => sum + value, 0) / latencySamples.length
+        : 0;
+    const hottest = [...modelCostTotals.entries()].sort((a, b) => b[1] - a[1])[0];
+    const hotModel = hottest ? hottest[0] : "n/a";
+
+    hud.setContent(
+      `{bold}AgentTop{/bold}  |  req: {green-fg}${requestsSeen}{/green-fg}  |  avg-latency: {yellow-fg}${avgLatency.toFixed(0)}ms{/yellow-fg}  |  top-model: {magenta-fg}${hotModel}{/magenta-fg}  |  {gray-fg}press{/gray-fg} {bold}q{/bold} {gray-fg}to exit{/gray-fg}`,
+    );
+  };
+
   const onMetric = (event: MetricEvent): void => {
     const nowSec = Math.floor(event.timestamp / 1000);
+    requestsSeen += 1;
     const currentTokens = perSecondTokens.get(nowSec) ?? 0;
     perSecondTokens.set(nowSec, currentTokens + event.totalTokens);
 
@@ -128,21 +176,31 @@ export function startDashboard(metricsBus: MetricsBus): Dashboard {
     totalSessionCost += event.costUsd;
     const modelTotal = modelCostTotals.get(event.model) ?? 0;
     modelCostTotals.set(event.model, modelTotal + event.costUsd);
+    latencySamples.push(event.latencyMs);
+    if (latencySamples.length > LATENCY_WINDOW) {
+      latencySamples.shift();
+    }
 
     requestLog.log(
-      `[${event.statusCode}] ${event.model} | ${event.latencyMs}ms | ${event.totalTokens} tokens | $${event.costUsd.toFixed(4)} | ${event.method} ${event.path}`,
+      `[${event.statusCode} OK] ${event.model} - ${(event.latencyMs / 1000).toFixed(2)}s - ${event.totalTokens} tokens - $${event.costUsd.toFixed(4)} - ${event.method} ${event.path}`,
     );
 
     renderTokens();
     renderModelCost();
+    renderModelTable();
+    renderLatency();
     renderTotalCost();
+    renderHud();
     screen.render();
   };
 
   metricsBus.onMetric(onMetric);
   renderTokens();
   renderModelCost();
+  renderModelTable();
+  renderLatency();
   renderTotalCost();
+  renderHud();
   screen.render();
 
   const refreshTicker = setInterval(() => {

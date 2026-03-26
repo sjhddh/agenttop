@@ -9,6 +9,8 @@
 - Model-level cost breakdown
 - Live request log with latency and token stats
 - Session cost LCD display
+- Streaming usage extraction for SSE responses (best-effort)
+- Prometheus metrics at `/metrics`
 
 ## Run
 

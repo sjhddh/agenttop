@@ -6,22 +6,11 @@ import {
   responseInterceptor,
 } from "http-proxy-middleware";
 import { MetricsBus, Provider } from "./events.js";
+import { calculateCostUsd } from "./pricing.js";
 
 const OPENAI_TARGET = "https://api.openai.com";
 const ANTHROPIC_TARGET = "https://api.anthropic.com";
 const DEFAULT_PORT = 8080;
-
-type ModelPricing = {
-  promptPerMillionUsd: number;
-  completionPerMillionUsd: number;
-};
-
-const MODEL_PRICING: Record<string, ModelPricing> = {
-  "gpt-4o": { promptPerMillionUsd: 5, completionPerMillionUsd: 15 },
-  "gpt-4o-mini": { promptPerMillionUsd: 0.15, completionPerMillionUsd: 0.6 },
-  "claude-3-5-sonnet": { promptPerMillionUsd: 3, completionPerMillionUsd: 15 },
-  "claude-3-5-haiku": { promptPerMillionUsd: 0.8, completionPerMillionUsd: 4 },
-};
 
 type UsageShape = {
   promptTokens: number;
@@ -37,6 +26,17 @@ type StartProxyOptions = {
 type StartedProxy = {
   app: Application;
   close: () => Promise<void>;
+};
+
+type ProxyCounters = {
+  requestsTotal: number;
+  promptTokensTotal: number;
+  completionTokensTotal: number;
+  totalTokensTotal: number;
+  totalCostUsd: number;
+  latencyMsSum: number;
+  latencyMsCount: number;
+  perModelCost: Map<string, number>;
 };
 
 function detectProvider(req: IncomingMessage): Provider {
@@ -67,34 +67,6 @@ function detectProvider(req: IncomingMessage): Provider {
   }
 
   return "openai";
-}
-
-function resolvePricing(model: string): ModelPricing | null {
-  const normalized = model.toLowerCase();
-  const direct = MODEL_PRICING[normalized];
-  if (direct) {
-    return direct;
-  }
-
-  const prefixMatch = Object.entries(MODEL_PRICING).find(([prefix]) =>
-    normalized.startsWith(prefix),
-  );
-  return prefixMatch ? prefixMatch[1] : null;
-}
-
-export function calculateCostUsd(
-  model: string,
-  promptTokens: number,
-  completionTokens: number,
-): number {
-  const pricing = resolvePricing(model);
-  if (!pricing) {
-    return 0;
-  }
-
-  const promptCost = (promptTokens / 1_000_000) * pricing.promptPerMillionUsd;
-  const completionCost = (completionTokens / 1_000_000) * pricing.completionPerMillionUsd;
-  return promptCost + completionCost;
 }
 
 export function parseUsage(payload: Record<string, unknown>, provider: Provider): UsageShape {
@@ -138,10 +110,154 @@ function shouldInspectResponse(proxyRes: IncomingMessage): boolean {
   return contentType.includes("application/json");
 }
 
+function parseSseUsage(rawBody: string, provider: Provider): UsageShape {
+  let promptTokens = 0;
+  let completionTokens = 0;
+  let totalTokens = 0;
+
+  const lines = rawBody.split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) {
+      continue;
+    }
+
+    const chunk = trimmed.slice(5).trim();
+    if (chunk.length === 0 || chunk === "[DONE]") {
+      continue;
+    }
+
+    try {
+      const payload = JSON.parse(chunk) as Record<string, unknown>;
+      const usage = parseUsage(payload, provider);
+      promptTokens = Math.max(promptTokens, usage.promptTokens);
+      completionTokens = Math.max(completionTokens, usage.completionTokens);
+      totalTokens = Math.max(totalTokens, usage.totalTokens);
+
+      // Anthropic streaming reports usage in nested message_delta payloads.
+      const delta = payload.delta as Record<string, unknown> | undefined;
+      const deltaUsage = delta?.usage as Record<string, unknown> | undefined;
+      if (provider === "anthropic" && deltaUsage) {
+        const deltaOutput = Number(deltaUsage.output_tokens ?? 0);
+        completionTokens = Math.max(completionTokens, deltaOutput);
+      }
+    } catch {
+      // Ignore malformed event chunks and continue parsing remaining stream events.
+    }
+  }
+
+  if (totalTokens === 0) {
+    totalTokens = promptTokens + completionTokens;
+  }
+
+  return { promptTokens, completionTokens, totalTokens };
+}
+
+function parseModelFromSse(rawBody: string): string {
+  const lines = rawBody.split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) {
+      continue;
+    }
+    const chunk = trimmed.slice(5).trim();
+    if (chunk.length === 0 || chunk === "[DONE]") {
+      continue;
+    }
+
+    try {
+      const payload = JSON.parse(chunk) as Record<string, unknown>;
+      const model = parseModel(payload);
+      if (model !== "unknown") {
+        return model;
+      }
+    } catch {
+      // Ignore malformed event chunks.
+    }
+  }
+
+  return "unknown";
+}
+
+function incrementCounters(counters: ProxyCounters, model: string, usage: UsageShape, costUsd: number, latencyMs: number): void {
+  counters.requestsTotal += 1;
+  counters.promptTokensTotal += usage.promptTokens;
+  counters.completionTokensTotal += usage.completionTokens;
+  counters.totalTokensTotal += usage.totalTokens;
+  counters.totalCostUsd += costUsd;
+  counters.latencyMsSum += latencyMs;
+  counters.latencyMsCount += 1;
+  counters.perModelCost.set(model, (counters.perModelCost.get(model) ?? 0) + costUsd);
+}
+
+function renderPrometheusMetrics(counters: ProxyCounters): string {
+  const lines: string[] = [
+    "# HELP agenttop_requests_total Total intercepted API responses.",
+    "# TYPE agenttop_requests_total counter",
+    `agenttop_requests_total ${counters.requestsTotal}`,
+    "# HELP agenttop_tokens_total Total token usage by type.",
+    "# TYPE agenttop_tokens_total counter",
+    `agenttop_tokens_total{type=\"prompt\"} ${counters.promptTokensTotal}`,
+    `agenttop_tokens_total{type=\"completion\"} ${counters.completionTokensTotal}`,
+    `agenttop_tokens_total{type=\"all\"} ${counters.totalTokensTotal}`,
+    "# HELP agenttop_cost_usd_total Total estimated spend in USD.",
+    "# TYPE agenttop_cost_usd_total counter",
+    `agenttop_cost_usd_total ${counters.totalCostUsd}`,
+    "# HELP agenttop_request_latency_ms_sum Sum of response latencies in milliseconds.",
+    "# TYPE agenttop_request_latency_ms_sum counter",
+    `agenttop_request_latency_ms_sum ${counters.latencyMsSum}`,
+    "# HELP agenttop_request_latency_ms_count Number of responses included in latency metrics.",
+    "# TYPE agenttop_request_latency_ms_count counter",
+    `agenttop_request_latency_ms_count ${counters.latencyMsCount}`,
+  ];
+
+  for (const [model, modelCost] of counters.perModelCost.entries()) {
+    const escapedModel = model.replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
+    lines.push(`agenttop_model_cost_usd_total{model="${escapedModel}"} ${modelCost}`);
+  }
+
+  return `${lines.join("\n")}\n`;
+}
+
+function emitAndTrack(
+  options: StartProxyOptions,
+  counters: ProxyCounters,
+  eventBase: Omit<Parameters<MetricsBus["emitMetric"]>[0], "timestamp">,
+): void {
+  const event = { ...eventBase, timestamp: Date.now() };
+  options.metricsBus.emitMetric(event);
+  incrementCounters(
+    counters,
+    event.model,
+    {
+      promptTokens: event.promptTokens,
+      completionTokens: event.completionTokens,
+      totalTokens: event.totalTokens,
+    },
+    event.costUsd,
+    event.latencyMs,
+  );
+}
+
 export function startProxy(options: StartProxyOptions): StartedProxy {
   const app = express();
   const port = options.port ?? DEFAULT_PORT;
   const startTimes = new WeakMap<IncomingMessage, number>();
+  const counters: ProxyCounters = {
+    requestsTotal: 0,
+    promptTokensTotal: 0,
+    completionTokensTotal: 0,
+    totalTokensTotal: 0,
+    totalCostUsd: 0,
+    latencyMsSum: 0,
+    latencyMsCount: 0,
+    perModelCost: new Map<string, number>(),
+  };
+
+  app.get("/metrics", (_req, res) => {
+    res.setHeader("content-type", "text/plain; version=0.0.4");
+    res.status(200).send(renderPrometheusMetrics(counters));
+  });
 
   app.use(
     "/",
@@ -166,8 +282,8 @@ export function startProxy(options: StartProxyOptions): StartedProxy {
           const method = req.method ?? "GET";
           const path = req.url ?? "/";
 
-          if (!shouldInspectResponse(proxyRes) || responseBuffer.length === 0) {
-            options.metricsBus.emitMetric({
+          if (responseBuffer.length === 0) {
+            emitAndTrack(options, counters, {
               provider,
               model: "unknown",
               promptTokens: 0,
@@ -176,20 +292,53 @@ export function startProxy(options: StartProxyOptions): StartedProxy {
               costUsd: 0,
               latencyMs,
               statusCode,
-              timestamp: Date.now(),
               method,
               path,
             });
             return responseBuffer;
           }
 
-          try {
-            const payload = JSON.parse(responseBuffer.toString("utf8")) as Record<string, unknown>;
-            const usage = parseUsage(payload, provider);
-            const model = parseModel(payload);
+          const contentType = String(proxyRes.headers["content-type"] ?? "").toLowerCase();
+          if (shouldInspectResponse(proxyRes)) {
+            try {
+              const payload = JSON.parse(responseBuffer.toString("utf8")) as Record<string, unknown>;
+              const usage = parseUsage(payload, provider);
+              const model = parseModel(payload);
+              const costUsd = calculateCostUsd(model, usage.promptTokens, usage.completionTokens);
+
+              emitAndTrack(options, counters, {
+                provider,
+                model,
+                promptTokens: usage.promptTokens,
+                completionTokens: usage.completionTokens,
+                totalTokens: usage.totalTokens,
+                costUsd,
+                latencyMs,
+                statusCode,
+                method,
+                path,
+              });
+            } catch {
+              emitAndTrack(options, counters, {
+                provider,
+                model: "unknown",
+                promptTokens: 0,
+                completionTokens: 0,
+                totalTokens: 0,
+                costUsd: 0,
+                latencyMs,
+                statusCode,
+                method,
+                path,
+              });
+            }
+          } else if (contentType.includes("text/event-stream")) {
+            const rawBody = responseBuffer.toString("utf8");
+            const usage = parseSseUsage(rawBody, provider);
+            const model = parseModelFromSse(rawBody);
             const costUsd = calculateCostUsd(model, usage.promptTokens, usage.completionTokens);
 
-            options.metricsBus.emitMetric({
+            emitAndTrack(options, counters, {
               provider,
               model,
               promptTokens: usage.promptTokens,
@@ -198,12 +347,11 @@ export function startProxy(options: StartProxyOptions): StartedProxy {
               costUsd,
               latencyMs,
               statusCode,
-              timestamp: Date.now(),
               method,
               path,
             });
-          } catch {
-            options.metricsBus.emitMetric({
+          } else {
+            emitAndTrack(options, counters, {
               provider,
               model: "unknown",
               promptTokens: 0,
@@ -212,7 +360,6 @@ export function startProxy(options: StartProxyOptions): StartedProxy {
               costUsd: 0,
               latencyMs,
               statusCode,
-              timestamp: Date.now(),
               method,
               path,
             });
